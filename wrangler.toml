@@ -3,4 +3,4 @@ main = "worker/proxy.js"
 compatibility_date = "2026-10-01"
 
 # [vars]
-# ALLOWED_ORIGIN = "https://your-site.example"
+# ALLOWED_ORIGIN = "rbxl-player-proxy.konoyo9641.workers.dev"
