@@ -2,5 +2,25 @@ name = "rbxl-player-proxy"
 main = "worker/proxy.js"
 compatibility_date = "2026-10-01"
 
-# [vars]
-# ALLOWED_ORIGIN = "rbxl-player-proxy.konoyo9641.workers.dev"
+[vars]
+# このプロキシを使ってよいサイトのOrigin(カンマ区切りで複数可)。秘密の値ではないのでここに書く。
+# ダッシュボードで設定した変数は、`wrangler deploy` のたびにここの値で置き換わるので、変更はこのファイルで行う。
+ALLOWED_ORIGIN = "https://thegameserver.pages.dev"
+# ROBLOX_API_KEY はシークレット: npx wrangler secret put ROBLOX_API_KEY(ここには書かない)
+
+# レート制限(Wrangler 4.36.0以降)。IPごと・Cloudflareの拠点ごとの近似値で、period は 10 か 60(秒)のみ。
+# namespace_id はアカウント内で重複しない正の整数の文字列。他のWorkerと被るなら変える。
+# 同じ学校・会社・携帯回線(NAT)の人は枠を共有するので、厳しくしすぎない。
+[[ratelimits]]
+name = "RL_REQUEST"   # 全リクエスト
+namespace_id = "3101"
+  [ratelimits.simple]
+  limit = 300
+  period = 60
+
+[[ratelimits]]
+name = "RL_UPSTREAM"  # Robloxを実際に呼ぶもの(キャッシュに無いアセット・users/avatar API)
+namespace_id = "3102"
+  [ratelimits.simple]
+  limit = 100
+  period = 60
