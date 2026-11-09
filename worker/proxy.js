@@ -1,17 +1,27 @@
-// Cloudflare Worker: Roblox用プロキシ(v3)
+// Cloudflare Worker: Roblox用プロキシ(v4)
 //
-//   GET  /health            → { ok, hasApiKey, originRestricted, rateLimit, version }   接続確認(キーの値は返さない)
+//   GET  /                  → 詰まり解消ページ(パスコードでレート制限を一時的に解除/再開)
+//   POST /unlock, /lock     → 上のページが呼ぶ。body: { passcode }。解除は BYPASS_SECONDS 秒で自動的に元に戻る
+//   GET  /health            → { ok, hasApiKey, originRestricted, rateLimit, rateLimitBypass, version }   接続確認(キーの値は返さない)
 //   GET  /asset/{id}        → アセット本体(Open Cloud Asset Delivery をAPIキーで呼び、CDNから取得して返す)
 //   GET|POST /?url=<URL>    → users / avatar の公開API用の中継(APIキーは付けない)。転送できるのは PROXY_RULES に書いたものだけ
 //
 // 設定:
 //   ROBLOX_API_KEY  (シークレット)  Open CloudのAPIキー。コードやwrangler.tomlには書かない。
 //                                  npx wrangler secret put ROBLOX_API_KEY  /  ダッシュボードの「変数とシークレット」
+//   ADMIN_PASSCODE  (シークレット)  詰まり解消ページのパスコード。長く推測されにくいものにする(16文字以上推奨)。
+//                                  npx wrangler secret put ADMIN_PASSCODE
+//   RL_BYPASS       (KVバインディング)  解除フラグの保存先。wrangler.toml 参照。無いと解除機能は使えない(他は動く)。
 //   ALLOWED_ORIGIN  (変数)          例: https://your-site.pages.dev(カンマ区切りで複数可)。設定すると、そのOriginのリクエストだけ受け付ける。
 //                                  秘密の値ではないので wrangler.toml の [vars] に書いてよい。未設定だと誰でも使える(/health に出る)。
 //   RL_REQUEST / RL_UPSTREAM  (Rate Limiting バインディング・任意)  wrangler.toml 参照。無ければ制限なしで動く。
 //
 // 背景: 2025-04-02以降、Asset Deliveryは認証なしだと401を返すため、アセット取得にはAPIキーが必要。
+//
+// 429の出どころは { error: 'RATE_LIMITED', source } の source で見分ける:
+//   worker-request  … RL_REQUEST(全リクエストの上限)   → パスコードで解除できる
+//   worker-upstream … RL_UPSTREAM(Robloxを呼ぶ分の上限) → パスコードで解除できる
+//   roblox          … Roblox側(APIキー)の上限         → 解除できない。待つ/キャッシュで減らす
 
 // 汎用の中継(?url=)で転送してよいリクエスト。アプリが使うものだけを許可する。増やすときはここに足す。
 const PROXY_RULES = [
@@ -28,6 +38,7 @@ const ASSET_PATH = /^\/asset\/(\d{1,19})$/;
 const MAX_BODY_BYTES = 16 * 1024;          // 中継するPOSTの本文の上限
 const MAX_ASSET_BYTES = 64 * 1024 * 1024;  // 返すアセットの上限
 const RETRY_AFTER_SECONDS = 30;
+const BYPASS_SECONDS = 3600;               // 解除の有効時間(KVの最小は60秒)。過ぎると自動で元に戻る
 
 const originList = (env) => String((env && env.ALLOWED_ORIGIN) || '*').split(',').map((s) => s.trim()).filter(Boolean);
 const restricted = (env) => { const l = originList(env); return l.length > 0 && !l.includes('*'); };
@@ -49,7 +60,8 @@ function corsHeaders(env, req) {
 
 const json = (obj, status, cors, extra) =>
   new Response(JSON.stringify(obj), { status, headers: { ...cors, ...(extra || {}), 'Content-Type': 'application/json' } });
-const tooMany = (cors) => json({ error: 'RATE_LIMITED' }, 429, cors, { 'Retry-After': String(RETRY_AFTER_SECONDS) });
+const tooMany = (cors, source) =>
+  json({ error: 'RATE_LIMITED', source }, 429, cors, { 'Retry-After': String(RETRY_AFTER_SECONDS) });
 
 // ※Originはブラウザ以外なら偽装できるため、これは「他のサイトからのうっかり利用」を防ぐ程度の保護。悪用の歯止めはレート制限と転送先の限定。
 function originOk(env, req) {
@@ -63,6 +75,17 @@ async function limited(binding, key) {
   try { const { success } = await binding.limit({ key }); return !success; } catch (e) { return false; }
 }
 const clientKey = (req) => req.headers.get('CF-Connecting-IP') || 'unknown';
+
+// 詰まり解消: 解除フラグ(KV)が立っている間はレート制限を無視する。
+// 制限に当たったときだけ読むので、普段はKVを読まない。KVの反映は最大1分ほど遅れることがある。
+async function bypassed(env) {
+  if (!env || !env.RL_BYPASS) return false;
+  try { return (await env.RL_BYPASS.get('bypass', { cacheTtl: 30 })) === '1'; } catch (e) { return false; }
+}
+async function overLimit(env, name, req) {
+  if (!(await limited(env && env[name], clientKey(req)))) return false;
+  return !(await bypassed(env));
+}
 
 const cdnHost = (u) => u.protocol === 'https:' && CDN_HOSTS.some((re) => re.test(u.hostname));
 
@@ -84,14 +107,14 @@ async function handleAsset(id, env, req, ctx, cors) {
   }
 
   // ここから先はRobloxを呼ぶ(キーを消費する)ので、IPごとに厳しめに制限する
-  if (await limited(env.RL_UPSTREAM, clientKey(req))) return tooMany(cors);
+  if (await overLimit(env, 'RL_UPSTREAM', req)) return tooMany(cors, 'worker-upstream');
 
   let meta;
   try {
     const r = await fetch(ASSET_API + id, { headers: { 'x-api-key': env.ROBLOX_API_KEY, Accept: 'application/json' } });
     if (r.status === 401 || r.status === 403) return json({ error: 'KEY_REJECTED', status: r.status }, 401, cors);
     if (r.status === 404) return json({ error: 'NOT_FOUND' }, 404, cors);
-    if (r.status === 429) return json({ error: 'RATE_LIMITED' }, 429, cors, { 'Retry-After': String(RETRY_AFTER_SECONDS) });
+    if (r.status === 429) return tooMany(cors, 'roblox');
     if (!r.ok) return json({ error: 'UPSTREAM', status: r.status }, 502, cors);
     meta = await r.json();
   } catch (e) {
@@ -134,7 +157,7 @@ async function handleProxy(req, env, cors) {
     if (body.byteLength > MAX_BODY_BYTES) return new Response('too large', { status: 413, headers: cors });
   }
 
-  if (await limited(env && env.RL_UPSTREAM, clientKey(req))) return tooMany(cors);
+  if (await overLimit(env, 'RL_UPSTREAM', req)) return tooMany(cors, 'worker-upstream');
 
   // 注意: この経路ではAPIキーを付けない(キー付きの中継にしないため)。リダイレクトは追わない(許可していないホストへ飛ばされないように)
   const init = { method: req.method, headers: { Accept: req.headers.get('Accept') || '*/*' }, redirect: 'manual' };
@@ -151,6 +174,96 @@ async function handleProxy(req, env, cors) {
   return new Response(upstream.body, { status: upstream.status, headers: h });
 }
 
+// ---- 詰まり解消ページ ----
+// CORSヘッダは付けない(他サイトのページからは結果を読めない)。Originの制限・レート制限の手前で処理するので、詰まっていても開ける。
+
+const ADMIN_HTML = `<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>プロキシ 詰まり解消</title>
+<style>
+body{font-family:system-ui,sans-serif;max-width:28rem;margin:2rem auto;padding:0 1rem;line-height:1.6}
+input,button{font-size:1rem;padding:.6rem;width:100%;box-sizing:border-box;margin:.3rem 0}
+button{cursor:pointer}
+#st,#msg{padding:.6rem;border-radius:.4rem;background:#8882}
+</style></head><body>
+<h1>詰まり解消</h1>
+<p id="st">状態を確認中…</p>
+<input id="pw" type="password" placeholder="パスコード" autocomplete="current-password">
+<button id="on">レート制限を解除する(1時間)</button>
+<button id="off">レート制限を再開する</button>
+<p id="msg" hidden></p>
+<p><small>解除中はこのWorkerのレート制限(RL_REQUEST / RL_UPSTREAM)だけが無効になります。Roblox側の429は解除できません。反映まで最大1分ほどかかることがあります。</small></p>
+<script>
+const $=(i)=>document.getElementById(i);
+async function refresh(){
+  try{
+    const h=await (await fetch('/health')).json();
+    $('st').textContent='レート制限: '+(h.rateLimit?'設定あり':'設定なし')+' / 解除: '+(h.rateLimitBypass?'中(解除されている)':'していない');
+  }catch(e){$('st').textContent='状態を取得できませんでした';}
+}
+async function act(path){
+  const m=$('msg');m.hidden=false;m.textContent='送信中…';
+  try{
+    const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({passcode:$('pw').value})});
+    const j=await r.json();
+    m.textContent=r.ok?(j.bypass?'解除しました(約'+Math.round(j.seconds/60)+'分間)':'再開しました'):'失敗: '+j.error;
+  }catch(e){m.textContent='通信に失敗しました';}
+  refresh();
+}
+$('on').onclick=()=>act('/unlock');
+$('off').onclick=()=>act('/lock');
+refresh();
+</script></body></html>`;
+
+const adminJson = (obj, status) =>
+  new Response(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
+
+// パスコードの比較(長さや一致位置が時間でばれないよう、ハッシュにして全バイト比べる)
+async function safeEqual(a, b) {
+  const enc = new TextEncoder();
+  const [ha, hb] = await Promise.all([crypto.subtle.digest('SHA-256', enc.encode(a)), crypto.subtle.digest('SHA-256', enc.encode(b))]);
+  const x = new Uint8Array(ha), y = new Uint8Array(hb);
+  let d = 0;
+  for (let i = 0; i < x.length; i++) d |= x[i] ^ y[i];
+  return d === 0;
+}
+
+async function handleAdmin(req, env, path) {
+  if (path === '/') {
+    return new Response(ADMIN_HTML, {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'X-Content-Type-Options': 'nosniff',
+        'Content-Security-Policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; form-action 'none'",
+      },
+    });
+  }
+  if (req.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
+  if (!env || !env.ADMIN_PASSCODE) return adminJson({ error: 'NO_PASSCODE_CONFIGURED' }, 503);
+  if (!env.RL_BYPASS) return adminJson({ error: 'NO_KV_BINDING' }, 503);
+  if (Number(req.headers.get('Content-Length')) > 1024) return adminJson({ error: 'TOO_LARGE' }, 413);
+
+  let b;
+  try { b = await req.json(); } catch (e) { b = {}; }
+  const good = b && typeof b.passcode === 'string' && await safeEqual(b.passcode, String(env.ADMIN_PASSCODE));
+  if (!good) {
+    await new Promise((r) => setTimeout(r, 1000)); // 総当たりを遅くする(パスコードは長くすること)
+    return adminJson({ error: 'BAD_PASSCODE' }, 401);
+  }
+  try {
+    if (path === '/unlock') {
+      await env.RL_BYPASS.put('bypass', '1', { expirationTtl: BYPASS_SECONDS });
+      return adminJson({ ok: true, bypass: true, seconds: BYPASS_SECONDS }, 200);
+    }
+    await env.RL_BYPASS.delete('bypass');
+    return adminJson({ ok: true, bypass: false }, 200);
+  } catch (e) {
+    return adminJson({ error: 'KV_ERROR' }, 500);
+  }
+}
+
 export default {
   async fetch(req, env, ctx) {
     const cors = corsHeaders(env, req);
@@ -163,11 +276,16 @@ export default {
     if (url.pathname === '/health') {
       return json({
         ok: true, hasApiKey: Boolean(env && env.ROBLOX_API_KEY), originRestricted: restricted(env),
-        rateLimit: Boolean(env && env.RL_REQUEST && env.RL_UPSTREAM), version: 3,
+        rateLimit: Boolean(env && env.RL_REQUEST && env.RL_UPSTREAM), rateLimitBypass: await bypassed(env), version: 4,
       }, 200, cors);
     }
+    // 詰まり解消ページ(Origin制限・レート制限より前に処理する)。/ に ?url= が付いていれば従来どおり中継
+    if ((url.pathname === '/' && !url.searchParams.has('url') && req.method === 'GET')
+      || url.pathname === '/unlock' || url.pathname === '/lock') {
+      return handleAdmin(req, env, url.pathname);
+    }
     if (!originOk(env, req)) return json({ error: 'ORIGIN_NOT_ALLOWED' }, 403, cors);
-    if (await limited(env && env.RL_REQUEST, clientKey(req))) return tooMany(cors); // 全リクエスト(キャッシュに当たるものも)の上限
+    if (await overLimit(env, 'RL_REQUEST', req)) return tooMany(cors, 'worker-request'); // 全リクエスト(キャッシュに当たるものも)の上限
 
     const m = ASSET_PATH.exec(url.pathname);
     if (m && req.method === 'GET') return handleAsset(m[1], env, req, ctx, cors);
