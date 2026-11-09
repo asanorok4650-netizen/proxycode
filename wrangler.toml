@@ -7,6 +7,12 @@ compatibility_date = "2026-10-01"
 # ダッシュボードで設定した変数は、`wrangler deploy` のたびにここの値で置き換わるので、変更はこのファイルで行う。
 ALLOWED_ORIGIN = "https://thegameserver.pages.dev, http://127.0.0.1:8000"
 # ROBLOX_API_KEY はシークレット: npx wrangler secret put ROBLOX_API_KEY(ここには書かない)
+# ADMIN_PASSCODE もシークレット: npx wrangler secret put ADMIN_PASSCODE(詰まり解消ページのパスコード。長めに)
+
+# 詰まり解消(レート制限の一時解除)フラグの保存先。idを書かないと、deploy時に自動で作られる(Wrangler 4.45以降)。
+# 自動作成されずエラーになる場合は `npx wrangler kv namespace create RL_BYPASS` で作り、出てきた id = "..." をここに足す。
+[[kv_namespaces]]
+binding = "RL_BYPASS"
 
 # レート制限(Wrangler 4.36.0以降)。IPごと・Cloudflareの拠点ごとの近似値で、period は 10 か 60(秒)のみ。
 # namespace_id はアカウント内で重複しない正の整数の文字列。他のWorkerと被るなら変える。
