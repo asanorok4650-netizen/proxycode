@@ -5,7 +5,7 @@ compatibility_date = "2026-10-01"
 [vars]
 # このプロキシを使ってよいサイトのOrigin(カンマ区切りで複数可)。秘密の値ではないのでここに書く。
 # ダッシュボードで設定した変数は、`wrangler deploy` のたびにここの値で置き換わるので、変更はこのファイルで行う。
-ALLOWED_ORIGIN = "https://thegameserver.pages.dev"
+ALLOWED_ORIGIN = "https://thegameserver.pages.dev,http://127.0.0.1:8000/"
 # ROBLOX_API_KEY はシークレット: npx wrangler secret put ROBLOX_API_KEY(ここには書かない)
 # ADMIN_PASSCODE もシークレット: npx wrangler secret put ADMIN_PASSCODE(詰まり解消ページのパスコード。長めに)
 
