@@ -2,7 +2,7 @@
 //
 //   GET  /                  → 詰まり解消ページ(パスコードでレート制限を一時的に解除/再開・アセット取得テスト)
 //   POST /unlock, /lock     → 上のページが呼ぶ。body: { passcode }。解除は BYPASS_SECONDS 秒で自動的に元に戻る
-//   POST /test              → 上のページが呼ぶ。body: { passcode, assetId }。キーの診断・Robloxのキー検査・アセット取得の応答をそのまま返す
+//   POST /test              → 上のページが呼ぶ。body: { passcode, assetId }。キーの診断・接続元IP・Robloxのキー検査・アセット取得の応答をそのまま返す
 //   GET  /health            → { ok, hasApiKey, originRestricted, rateLimit, rateLimitBypass, version }   接続確認(キーの値は返さない)
 //   GET  /asset/{id}        → アセット本体(Open Cloud Asset Delivery を APIキーで呼び、CDNから取得して返す)
 //   GET|POST /?url=<URL>    → users / avatar の公開API用の中継(APIキーは付けない)。転送できるのは PROXY_RULES に書いたものだけ
@@ -34,6 +34,7 @@ const PROXY_RULES = [
 const CDN_HOSTS = [/(^|\.)roblox\.com$/, /(^|\.)rbxcdn\.com$/];
 const ASSET_API = 'https://apis.roblox.com/asset-delivery-api/v1/assetId/';
 const INTROSPECT_API = 'https://apis.roblox.com/api-keys/v1/introspect';
+const EGRESS_IP_API = 'https://api64.ipify.org?format=json';
 const ASSET_PATH = /^\/asset\/(\d{1,19})$/;
 
 const MAX_BODY_BYTES = 16 * 1024;          // 中継するPOSTの本文の上限
@@ -253,8 +254,9 @@ async function safeEqual(a, b) {
   return d === 0;
 }
 
-// アセット取得テスト。3つを返す:
-//   keyInfo    … 保存されているキーの形(長さ・前後の空白・使える文字だけか)。値そのものは返さない
+// アセット取得テスト。返すもの:
+//   keyInfo    … 保存されているキーの形(長さ・前後の空白・使える文字だけか)と、末尾6文字(このWorkerが使っているキーがどれか見分ける用)
+//   egress     … このWorkerから外へ出るときのIP(IPv4かIPv6か)。キーの許可IPと照らし合わせる用
 //   introspect … Robloxのキー検査(有効か・期限切れか・このWorkerのIPから使えるか・権限一覧)
 //   asset      … Asset Deliveryの応答(ステータス・ヘッダー・本文)をそのまま
 async function runTest(env, rawId) {
@@ -265,8 +267,18 @@ async function runTest(env, rawId) {
   if (!key) return adminJson({ error: 'NO_API_KEY' }, 503);
 
   const out = {
-    keyInfo: { length: raw.length, trimmedLength: key.length, hadOuterWhitespace: raw !== key, printableAsciiOnly: /^[\x21-\x7e]+$/.test(key) },
+    keyInfo: {
+      length: raw.length, trimmedLength: key.length, hadOuterWhitespace: raw !== key,
+      printableAsciiOnly: /^[\x21-\x7e]+$/.test(key), last6: key.slice(-6),
+    },
   };
+
+  try {
+    const r = await fetch(EGRESS_IP_API);
+    out.egress = JSON.parse(await r.text());
+  } catch (e) {
+    out.egress = { error: 'FETCH_FAILED' };
+  }
 
   try {
     const r = await fetch(INTROSPECT_API, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ apiKey: key }) });
