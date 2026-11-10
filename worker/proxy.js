@@ -2,14 +2,14 @@
 //
 //   GET  /                  → 詰まり解消ページ(パスコードでレート制限を一時的に解除/再開・アセット取得テスト)
 //   POST /unlock, /lock     → 上のページが呼ぶ。body: { passcode }。解除は BYPASS_SECONDS 秒で自動的に元に戻る
-//   POST /test              → 上のページが呼ぶ。body: { passcode, assetId }。Robloxの応答(ステータス・ヘッダー・本文)をそのまま返す
+//   POST /test              → 上のページが呼ぶ。body: { passcode, assetId }。キーの診断・Robloxのキー検査・アセット取得の応答をそのまま返す
 //   GET  /health            → { ok, hasApiKey, originRestricted, rateLimit, rateLimitBypass, version }   接続確認(キーの値は返さない)
-//   GET  /asset/{id}        → アセット本体(Open Cloud Asset Delivery をAPIキーで呼び、CDNから取得して返す)
+//   GET  /asset/{id}        → アセット本体(Open Cloud Asset Delivery を APIキーで呼び、CDNから取得して返す)
 //   GET|POST /?url=<URL>    → users / avatar の公開API用の中継(APIキーは付けない)。転送できるのは PROXY_RULES に書いたものだけ
 //
 // 設定:
 //   ROBLOX_API_KEY  (シークレット)  Open CloudのAPIキー(権限は legacy-asset:manage)。コードやwrangler.tomlには書かない。
-//                                  ダッシュボードの「変数とシークレット」で種類を「シークレット」にして設定
+//                                  ダッシュボードの「変数とシークレット」で種類を「シークレット」にして設定(ランタイム側)。前後の空白は自動で取り除く
 //   ADMIN_PASSCODE  (シークレット)  詰まり解消ページのパスコード。長く推測されにくいものにする(16文字以上推奨)。
 //   RL_BYPASS       (KVバインディング)  解除フラグの保存先。無いと解除機能は使えない(他は動く)。
 //   ALLOWED_ORIGIN  (変数)          例: https://your-site.pages.dev(カンマ区切りで複数可)。設定すると、そのOriginのリクエストだけ受け付ける。
@@ -33,16 +33,20 @@ const PROXY_RULES = [
 // アセットの実体(Asset Deliveryが教えてくれるCDNのURL)として受け付けるホスト
 const CDN_HOSTS = [/(^|\.)roblox\.com$/, /(^|\.)rbxcdn\.com$/];
 const ASSET_API = 'https://apis.roblox.com/asset-delivery-api/v1/assetId/';
+const INTROSPECT_API = 'https://apis.roblox.com/api-keys/v1/introspect';
 const ASSET_PATH = /^\/asset\/(\d{1,19})$/;
 
 const MAX_BODY_BYTES = 16 * 1024;          // 中継するPOSTの本文の上限
 const MAX_ASSET_BYTES = 64 * 1024 * 1024;  // 返すアセットの上限
 const RETRY_AFTER_SECONDS = 30;
 const BYPASS_SECONDS = 3600;               // 解除の有効時間(KVの最小は60秒)。過ぎると自動で元に戻る
-const TEST_BODY_CHARS = 4000;              // アセット取得テストで返す本文の最大文字数
+const TEST_BODY_CHARS = 4000;              // テストで返す本文の最大文字数
 
 const originList = (env) => String((env && env.ALLOWED_ORIGIN) || '*').split(',').map((s) => s.trim()).filter(Boolean);
 const restricted = (env) => { const l = originList(env); return l.length > 0 && !l.includes('*'); };
+
+// コピペで混ざりがちな前後の空白・改行を取り除いたAPIキー
+const apiKeyOf = (env) => String((env && env.ROBLOX_API_KEY) || '').trim();
 
 // ALLOWED_ORIGIN が設定されている場合、一致したOriginだけを返す(Access-Control-Allow-Origin は1つだけ返せるため)
 function corsHeaders(env, req) {
@@ -93,7 +97,8 @@ async function overLimit(env, name, req) {
 const cdnHost = (u) => u.protocol === 'https:' && CDN_HOSTS.some((re) => re.test(u.hostname));
 
 async function handleAsset(id, env, req, ctx, cors) {
-  if (!env || !env.ROBLOX_API_KEY) return json({ error: 'NO_API_KEY' }, 503, cors);
+  const apiKey = apiKeyOf(env);
+  if (!apiKey) return json({ error: 'NO_API_KEY' }, 503, cors);
 
   // エッジキャッシュ(ヒットすればRoblox APIを呼ばない = キーのレート制限を節約)
   const cache = typeof caches !== 'undefined' ? caches.default : null;
@@ -114,7 +119,7 @@ async function handleAsset(id, env, req, ctx, cors) {
 
   let meta;
   try {
-    const r = await fetch(ASSET_API + id, { headers: { 'x-api-key': env.ROBLOX_API_KEY, Accept: 'application/json' } });
+    const r = await fetch(ASSET_API + id, { headers: { 'x-api-key': apiKey, Accept: 'application/json' } });
     if (r.status === 401 || r.status === 403) return json({ error: 'KEY_REJECTED', status: r.status }, 401, cors);
     if (r.status === 404) return json({ error: 'NOT_FOUND' }, 404, cors);
     if (r.status === 429) {
@@ -202,9 +207,9 @@ pre{padding:.6rem;border-radius:.4rem;background:#8882;white-space:pre-wrap;word
 <p id="msg" hidden></p>
 <h2>アセット取得テスト</h2>
 <input id="aid" type="text" inputmode="numeric" placeholder="アセットID(数字)">
-<button id="test">Robloxに1件リクエストして結果を見る</button>
+<button id="test">キー診断とRobloxへの1件リクエストを実行</button>
 <pre id="out" hidden></pre>
-<p><small>解除中はこのWorkerのレート制限(RL_REQUEST / RL_UPSTREAM)だけが無効になります。Roblox側の429は解除できません。反映まで最大1分ほどかかることがあります。テストはRobloxを1回呼び、APIキーの枠を消費します(Workerのレート制限は通りません)。</small></p>
+<p><small>解除中はこのWorkerのレート制限(RL_REQUEST / RL_UPSTREAM)だけが無効になります。Roblox側の429は解除できません。反映まで最大1分ほどかかることがあります。テストはRobloxを呼び、APIキーの枠を消費します(Workerのレート制限は通りません)。</small></p>
 <script>
 const $=(i)=>document.getElementById(i);
 async function refresh(){
@@ -248,25 +253,43 @@ async function safeEqual(a, b) {
   return d === 0;
 }
 
-// アセット取得テスト: Roblox(Asset Delivery)の応答のステータス・ヘッダー・本文をそのまま返す。
-// 429の原因(Roblox側か自分側か)や Retry-After、x-ratelimit系のヘッダーを確認するためのもの。
+// アセット取得テスト。3つを返す:
+//   keyInfo    … 保存されているキーの形(長さ・前後の空白・使える文字だけか)。値そのものは返さない
+//   introspect … Robloxのキー検査(有効か・期限切れか・このWorkerのIPから使えるか・権限一覧)
+//   asset      … Asset Deliveryの応答(ステータス・ヘッダー・本文)をそのまま
 async function runTest(env, rawId) {
   const id = String(rawId || '').trim();
   if (!/^\d{1,19}$/.test(id)) return adminJson({ error: 'BAD_ASSET_ID' }, 400);
-  if (!env.ROBLOX_API_KEY) return adminJson({ error: 'NO_API_KEY' }, 503);
+  const raw = String((env && env.ROBLOX_API_KEY) || '');
+  const key = raw.trim();
+  if (!key) return adminJson({ error: 'NO_API_KEY' }, 503);
+
+  const out = {
+    keyInfo: { length: raw.length, trimmedLength: key.length, hadOuterWhitespace: raw !== key, printableAsciiOnly: /^[\x21-\x7e]+$/.test(key) },
+  };
+
+  try {
+    const r = await fetch(INTROSPECT_API, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ apiKey: key }) });
+    const text = await r.text();
+    out.introspect = { status: r.status, body: text.slice(0, TEST_BODY_CHARS) };
+  } catch (e) {
+    out.introspect = { error: 'FETCH_FAILED', message: String((e && e.message) || e) };
+  }
+
   const t0 = Date.now();
   try {
-    const r = await fetch(ASSET_API + id, { headers: { 'x-api-key': env.ROBLOX_API_KEY, Accept: 'application/json' } });
+    const r = await fetch(ASSET_API + id, { headers: { 'x-api-key': key, Accept: 'application/json' } });
     const text = await r.text();
     const headers = {};
     r.headers.forEach((v, k) => { if (k !== 'set-cookie') headers[k] = v; });
-    return adminJson({
+    out.asset = {
       ok: r.ok, status: r.status, statusText: r.statusText, ms: Date.now() - t0,
       headers, body: text.slice(0, TEST_BODY_CHARS), truncated: text.length > TEST_BODY_CHARS,
-    }, 200);
+    };
   } catch (e) {
-    return adminJson({ error: 'FETCH_FAILED', message: String((e && e.message) || e) }, 502);
+    out.asset = { error: 'FETCH_FAILED', message: String((e && e.message) || e) };
   }
+  return adminJson(out, 200);
 }
 
 async function handleAdmin(req, env, path) {
@@ -317,7 +340,7 @@ export default {
 
     if (url.pathname === '/health') {
       return json({
-        ok: true, hasApiKey: Boolean(env && env.ROBLOX_API_KEY), originRestricted: restricted(env),
+        ok: true, hasApiKey: Boolean(apiKeyOf(env)), originRestricted: restricted(env),
         rateLimit: Boolean(env && env.RL_REQUEST && env.RL_UPSTREAM), rateLimitBypass: await bypassed(env), version: 4,
       }, 200, cors);
     }
